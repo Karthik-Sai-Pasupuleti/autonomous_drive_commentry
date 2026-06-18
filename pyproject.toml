@@ -1,0 +1,26 @@
+[project]
+name = "speech-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gtts>=2.5.4",
+    "langchain-ollama>=1.1.0",
+    "langgraph>=1.2.5",
+    "numpy>=2.2.6",
+    "ollama>=0.6.2",
+    "opencv-python>=4.13.0.92",
+    "pydantic>=2.13.4",
+    "pyttsx3>=2.99",
+    "toml>=0.10.2",
+    "tomli>=2.4.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
