@@ -34,6 +34,9 @@ def _play_windows(path: str) -> None:
     """Play an MP3 synchronously via the Windows Media Control Interface."""
     import ctypes
 
+    # Only ever called on Windows (see _make_player); the assert also narrows the type so the
+    # Windows-only ``ctypes.windll`` resolves on every platform's type checker.
+    assert sys.platform == "win32"
     mci = ctypes.windll.winmm.mciSendStringW
     alias = "speech_agent_tts"
     # ``mpegvideo`` is the MCI device that handles MP3; ``wait`` blocks until done.
@@ -149,6 +152,33 @@ class Speaker:
         if self.enabled and text:
             self._queue.put(text)
 
+    def synthesize(self, text: str, path_stem: str) -> Optional[str]:
+        """Render *text* to an audio file (no playback) and return its path, or None.
+
+        Used to bake the spoken commentary into a saved video. Writes ``path_stem`` plus
+        the engine's natural extension (``.mp3`` for gtts, ``.wav`` for pyttsx3) and
+        returns that path; tries each usable engine in :attr:`_order` and returns None if
+        none is available or all fail. Unlike :meth:`say` this runs synchronously on the
+        caller's thread, so it is safe to call after :meth:`close`."""
+        if not text or not self._order:
+            return None
+        for name in self._order:
+            try:
+                if name == "gtts":
+                    assert self._gtts is not None  # set whenever "gtts" is in _order
+                    out = path_stem + ".mp3"
+                    self._gtts(text=text, lang=self.lang, slow=self.slow).save(out)
+                else:
+                    assert self._pyttsx3 is not None  # set whenever "pyttsx3" is in _order
+                    out = path_stem + ".wav"
+                    engine = self._pyttsx3.init()
+                    engine.save_to_file(text, out)
+                    engine.runAndWait()  # blocks until the file is written
+                return out
+            except Exception as exc:
+                print(f"[{name} synth failed: {exc}]")
+        return None
+
     def close(self) -> None:
         """Wait for queued lines to finish speaking, then stop the worker."""
         if not self.enabled:
@@ -156,7 +186,12 @@ class Speaker:
         self._queue.put(None)  # sentinel
         if self._thread is not None:
             self._thread.join(timeout=20)
-        if self._tmpdir and os.path.isdir(self._tmpdir):
+        # Only remove the tmpdir once the worker has actually exited. A long batch run
+        # can leave many lines still queued at the join timeout; deleting the dir out
+        # from under the worker makes its in-flight gtts writes fail noisily. If the
+        # worker is still alive (daemon thread), leave the dir — the OS reaps /tmp.
+        worker_done = self._thread is None or not self._thread.is_alive()
+        if worker_done and self._tmpdir and os.path.isdir(self._tmpdir):
             shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     # -- worker --------------------------------------------------------------
@@ -181,9 +216,11 @@ class Speaker:
                 self._queue.task_done()
 
     def _speak_gtts(self, text: str, counter: int) -> None:
+        # Both are set together in _probe_gtts whenever the gtts engine is selected.
+        assert self._gtts is not None and self._play is not None
         path = os.path.join(self._tmpdir or "", f"line_{counter}.mp3")
         self._gtts(text=text, lang=self.lang, slow=self.slow).save(path)
-        self._play(path)  # type: ignore[misc]  # blocks until the clip ends
+        self._play(path)  # blocks until the clip ends
 
     def _speak_pyttsx3(self, text: str) -> None:
         # The engine must live on the thread that drives it; create it lazily here.

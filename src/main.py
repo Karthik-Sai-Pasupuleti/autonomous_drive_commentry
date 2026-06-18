@@ -4,64 +4,79 @@ window, ask the vision model to explain the scene every N frames, overlay its re
 on the video, and *speak* the commentary aloud whenever the vehicle begins a new
 action (turning, slowing, stopping/yielding, resuming).
 
-The per-frame LangGraph is ``encode -> perceive -> gate -> narrate``:
+The per-frame LangGraph is `encode -> perceive -> gate -> narrate`:
 encode the frame, perceive it with the VLM, gate out redundant frames so only NEW
-actions are announced, then narrate the gated line through the :class:`Speaker`.
-
-Run from ``src/``::
-
-    uv run python main.py                          # default video
-    uv run python main.py --video PATH --every 15
-    uv run python main.py --no-speak               # overlay/print only, no audio
-
-Press ``q`` or ``Esc`` (or close the window) to quit.
+actions are announced, then narrate the gated line through the `Speaker`.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
-import json
-import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import textwrap
+from collections import deque
+from pathlib import Path
 from typing import Any, TypedDict
 
 import cv2
 from langgraph.graph import END, START, StateGraph
+from typing_extensions import Required
 
-from bot import Bot
+from bot import Bot, IDLE_MANEUVER, MANEUVERS
 from speaker import Speaker
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_VIDEO = os.path.normpath(os.path.join(_HERE, "..", "dataset", "screencast_third_person.webm"))
-DEFAULT_OUT = os.path.normpath(os.path.join(_HERE, "..", "output.mp4"))
+_HERE = Path(__file__).resolve().parent
+DEFAULT_VIDEO = str((_HERE / ".." / "dataset" / "screencast_third_person_720p.mp4").resolve())
+DEFAULT_OUT = str((_HERE / ".." / "output.mp4").resolve())
+
 WINDOW = "speech_agent"
-INPUT_SIZE = 256  # the whole pipeline runs at this square size to cut computation
+MODEL_LONG_SIDE = 512   # model input: longest edge in px; aspect ratio preserved (no square squash)
+TEMPORAL_FRAMES = 1     # frames sent per perception. 1 = single frame.
+TEMPORAL_STRIDE = 1     # perception steps between sampled frames.
 
 
-def frame_to_jpeg_b64(image, size: int = INPUT_SIZE, quality: int = 85) -> str:
-    """Resize a BGR frame to ``size`` x ``size`` and encode it as a base64 JPEG string.
-
-    A small fixed square keeps the vision model's input cheap and uniform to process.
+def frame_to_jpeg_b64(image: Any, long_side: int = MODEL_LONG_SIDE, quality: int = 90) -> str:
+    """Downscale a BGR frame so its longer edge is `long_side` px, preserving aspect
+    ratio, and encode it as a base64 JPEG string.
     """
-    image = cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
+    h, w = image.shape[:2]
+    scale = long_side / float(max(h, w))
+    if scale < 1.0:  # only ever downscale; never upscale a small frame
+        image = cv2.resize(
+            image, 
+            (max(1, round(w * scale)), max(1, round(h * scale))),
+            interpolation=cv2.INTER_AREA
+        )
     ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
     if not ok:
         raise RuntimeError("failed to encode frame as JPEG")
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def draw_reasoning(frame, text: str, t_sec: float):
-    """Return a copy of *frame* with the timestamp + wrapped *text* in a bottom panel."""
+def draw_reasoning(frame: Any, text: str, t_sec: float) -> Any:
+    """Return a copy of *frame* with the timestamp + wrapped spoken *text* in a bottom panel."""
     img = frame.copy()
     h, w = img.shape[:2]
-    max_chars = max(20, w // 12)
-    lines = []
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    s = max(0.5, w / 640.0)            # scale factor relative to the 640px baseline
+    ts_scale = 0.5 * s                 # timestamp header
+    tx_scale = 0.7 * s                 # spoken commentary
+    thick = max(1, round(1.6 * s))
+    line_h = int(34 * s)
+    pad = int(14 * s)
+
+    char_w = max(1, cv2.getTextSize("M", font, tx_scale, thick)[0][0])
+    max_chars = max(10, (w - 2 * pad) // char_w)
+    
+    lines: list[str] = []
     for para in text.splitlines() or [""]:
         lines.extend(textwrap.wrap(para, max_chars) or [""])
 
-    line_h, pad = 24, 12
     panel_h = pad * 2 + line_h * (len(lines) + 1)  # +1 for the timestamp line
     y0 = max(0, h - panel_h)
 
@@ -69,90 +84,82 @@ def draw_reasoning(frame, text: str, t_sec: float):
     cv2.rectangle(overlay, (0, y0), (w, h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
 
-    y = y0 + pad + 14
+    y = y0 + pad + int(line_h * 0.6)
     cv2.putText(img, f"t = {t_sec:6.2f}s", (pad, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 220, 255), 1, cv2.LINE_AA)
+                font, ts_scale, (120, 220, 255), thick, cv2.LINE_AA)
     for line in lines:
         y += line_h
         cv2.putText(img, line, (pad, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                    font, tx_scale, (255, 255, 255), thick, cv2.LINE_AA)
     return img
 
 
 class FrameState(TypedDict, total=False):
     """State threaded through the per-frame LangGraph (encode -> perceive -> gate -> narrate)."""
+    frame: Required[Any]  # source BGR frame (numpy array); always supplied at invoke
+    t_sec: float          # timestamp of this frame (for the gate's cooldown)
+    images_b64: list[str] # recent model-ready JPEGs, oldest -> newest (motion context)
+    maneuver: str         # parsed maneuver directly from Bot
+    commentary: str       # reasoning/commentary directly from Bot
+    speech: str           # gated announcement (non-empty only when a NEW action begins)
+    spoken: bool          # whether this frame produced speech
 
-    frame: Any        # source BGR frame (numpy array)
-    image_b64: str    # model-ready JPEG
-    reasoning: str    # the model's raw reply (perception)
-    maneuver: str     # parsed maneuver
-    speech: str       # gated announcement (non-empty only when an action begins)
-    spoken: bool      # whether this frame produced speech
 
+KNOWN_MANEUVERS = frozenset(MANEUVERS)
 
-# Closed set of maneuvers the prompt may return (mirrors RESPONSE_SCHEMA); anything
-# else -> NO_ACTION_STEADY_STATE (idle). Every maneuver except the idle one counts
-# as "an action" worth announcing.
-IDLE_MANEUVER = "NO_ACTION_STEADY_STATE"
-KNOWN_MANEUVERS = {
-    IDLE_MANEUVER,
-    "SLOWING_DOWN", "STOPPING", "YIELDING",
-    "TURNING_LEFT", "TURNING_RIGHT",
-    "CHANGING_LANES", "HAZARD_RESPONSE",
+MANEUVER_THEME = {
+    "SLOWING_DOWN": "slowing", "STOPPING": "slowing", "YIELDING": "slowing",
+    "HAZARD_RESPONSE": "slowing",
+    "TURNING_LEFT": "turning", "TURNING_RIGHT": "turning",
+    "CHANGING_LANES": "lane_change",
 }
 
+COOLDOWN_SEC = 10.0  # don't re-announce the same theme within this many seconds of playback
+MIN_GAP_SEC = 3.0    # hard floor between ANY two announcements (debounces rapid theme flip-flop)
 
-def parse_perception(text: str):
-    """Extract ``(maneuver, commentary)`` from the model's JSON reply; tolerant of junk."""
-    maneuver, commentary = IDLE_MANEUVER, ""
-    s = (text or "").strip()
-    start, end = s.find("{"), s.rfind("}")
-    if start != -1 and end != -1 and end > start:
+
+def build_graph(bot: Bot, speaker: Speaker | None = None) -> Any:
+    """Compile the LangGraph `encode -> perceive -> gate -> narrate`."""
+    memory: dict[str, Any] = {"last_theme": None, "last_t": -1e9}
+    buffer: deque[str] = deque(maxlen=(TEMPORAL_FRAMES - 1) * TEMPORAL_STRIDE + 1)
+
+    def encode(state: FrameState) -> dict[str, Any]:
+        buffer.append(frame_to_jpeg_b64(state["frame"]))
+        frames = list(buffer)
+        last = len(frames) - 1
+        idxs = sorted({max(0, last - k * TEMPORAL_STRIDE) for k in range(TEMPORAL_FRAMES)})
+        return {"images_b64": [frames[i] for i in idxs]}
+
+    def perceive(state: FrameState) -> dict[str, Any]:
         try:
-            data = json.loads(s[start : end + 1])
-        except (json.JSONDecodeError, ValueError):
-            data = None
-        if isinstance(data, dict):
-            maneuver = str(data.get("maneuver", "")).strip().upper()
-            commentary = str(data.get("commentary", "")).strip()
-    if maneuver not in KNOWN_MANEUVERS:
-        maneuver = IDLE_MANEUVER
-    return maneuver, commentary
+            images = state.get("images_b64") or []
+            # We now unpack the tuple directly from the updated Bot
+            maneuver, commentary = bot.invoke(images)
+        except Exception as exc:  # one bad frame shouldn't kill the run
+            print(f"[perceive error: {exc}]", flush=True)
+            maneuver, commentary = IDLE_MANEUVER, ""
+            
+        return {"maneuver": maneuver, "commentary": commentary}
 
+    def gate(state: FrameState) -> dict[str, Any]:
+        maneuver = state.get("maneuver", IDLE_MANEUVER)
+        commentary = state.get("commentary", "")
+        
+        theme = MANEUVER_THEME.get(maneuver)  # None for the idle maneuver
+        t = state.get("t_sec", 0.0)
+        gap = t - memory["last_t"]
+        
+        announce = bool(theme and commentary and gap >= MIN_GAP_SEC
+                        and (theme != memory["last_theme"] or gap >= COOLDOWN_SEC))
+        
+        if announce:
+            memory["last_theme"] = theme
+            memory["last_t"] = t
+            
+        speech = commentary if announce else ""
+        return {"speech": speech, "spoken": bool(speech)}
 
-def build_graph(bot: Bot, speaker: "Speaker | None" = None):
-    """Compile the LangGraph ``encode -> perceive -> gate -> narrate``.
-
-    The ``gate`` layer sits on top of perception and removes redundant frames: it
-    emits speech only when the car *begins* an action (any non-idle maneuver),
-    then stays silent until the car returns to NO_ACTION_STEADY_STATE. The
-    ``narrate`` layer voices that gated speech aloud (LINGO-style commentary)
-    without blocking the video loop; with no ``speaker`` it is an inert pass-through.
-    """
-    memory = {"prev_active": False}  # persists across per-frame invocations
-
-    def encode(state: FrameState) -> dict:
-        return {"image_b64": frame_to_jpeg_b64(state["frame"])}
-
-    def perceive(state: FrameState) -> dict:
-        try:
-            text = bot.invoke(state["image_b64"])
-        except Exception as exc:  # one bad frame shouldn't stop the run
-            text = f"[error: {exc}]"
-        return {"reasoning": text}
-
-    def gate(state: FrameState) -> dict:
-        maneuver, commentary = parse_perception(state.get("reasoning", ""))
-        active = maneuver != IDLE_MANEUVER
-        begins = active and not memory["prev_active"]  # backstop against repeats
-        memory["prev_active"] = active
-        # The model (with its MEMORY) already emits commentary only on a new
-        # action, so trust it; the begin-edge just guards against a stray repeat.
-        speech = commentary if (commentary and begins) else ""
-        return {"maneuver": maneuver, "speech": speech, "spoken": bool(speech)}
-
-    def narrate(state: FrameState) -> dict:
-        # Speak the gated line aloud; say() is non-blocking (off-thread synthesis).
+    def narrate(state: FrameState) -> dict[str, Any]:
         if speaker is not None:
             speaker.say(state.get("speech", ""))
         return {}
@@ -167,26 +174,76 @@ def build_graph(bot: Bot, speaker: "Speaker | None" = None):
     graph.add_edge("perceive", "gate")
     graph.add_edge("gate", "narrate")
     graph.add_edge("narrate", END)
+    
     return graph.compile()
+
+
+def finalize_video(video_path: str, events: list[tuple[float, str]], speaker: Speaker) -> bool:
+    """Re-encode *video_path* in place to a widely-playable H.264/AAC MP4."""
+    if shutil.which("ffmpeg") is None:
+        print("[ffmpeg not on PATH; cannot finalize — file left as MPEG-4, may not play]")
+        return False
+
+    tmpdir = tempfile.mkdtemp(prefix="speech_agent_mux_")
+    final = f"{video_path}.final.mp4"
+    
+    venc = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-movflags", "+faststart"]
+    
+    try:
+        clips: list[tuple[float, str]] = []  # (t_sec, audio_path)
+        for i, (t_sec, text) in enumerate(events):
+            # Resolve to standard string paths for OS/subprocess safety
+            path = speaker.synthesize(text, str(Path(tmpdir) / f"clip_{i}"))
+            if path:
+                clips.append((t_sec, path))
+
+        if clips:
+            inputs, filters, labels = ["-i", video_path], [], []
+            for i, (t_sec, path) in enumerate(clips):
+                inputs += ["-i", path]
+                ms = max(0, int(round(t_sec * 1000)))
+                filters.append(f"[{i + 1}:a]adelay={ms}:all=1[d{i}]")
+                labels.append(f"[d{i}]")
+                
+            if len(clips) == 1:
+                filtergraph = filters[0].replace("[d0]", "[aout]")
+            else:
+                filtergraph = (";".join(filters) + ";" + "".join(labels)
+                               + f"amix=inputs={len(clips)}:normalize=0[aout]")
+                
+            cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", filtergraph,
+                   "-map", "0:v:0", "-map", "[aout]", *venc, "-c:a", "aac", final]
+        else:
+            print("[no commentary to add; re-encoding to a silent but playable file]")
+            cmd = ["ffmpeg", "-y", "-i", video_path, "-map", "0:v:0", *venc, final]
+
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            tail = proc.stderr.decode(errors="replace")[-800:]
+            print(f"[ffmpeg finalize failed; original file left as-is]\n{tail}")
+            return False
+            
+        Path(final).replace(video_path)  # atomic swap using pathlib
+        return bool(clips)
+        
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        if Path(final).exists():
+            Path(final).unlink()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Explain an RViz screencast frame by frame.")
     parser.add_argument("--video", default=DEFAULT_VIDEO, help="path to the screencast")
     parser.add_argument("--model", default=None, help="override the Ollama model tag")
-    parser.add_argument("--every", type=int, default=5, help="run the model on 1 of every N frames")
-    parser.add_argument("--out", default=DEFAULT_OUT,
-                        help="save the annotated video here (pass '' to disable saving)")
-    parser.add_argument("--max-frames", type=int, default=0,
-                        help="stop after this many frames (0 = whole video)")
-    parser.add_argument("--no-speak", action="store_true",
-                        help="disable spoken commentary (text/overlay only)")
-    parser.add_argument("--voice", choices=("auto", "gtts", "pyttsx3"), default="auto",
-                        help="TTS engine: gtts (Google, online), pyttsx3 (offline OS voice), "
-                             "or auto (gtts with offline fallback)")
+    parser.add_argument("--every", type=int, default=5, help="run the model on 1 of every N frames.")
+    parser.add_argument("--out", default=DEFAULT_OUT, help="save the annotated video here (pass '' to disable)")
+    parser.add_argument("--max-frames", type=int, default=0, help="stop after this many frames (0 = whole video)")
+    parser.add_argument("--no-speak", action="store_true", help="disable spoken commentary (text/overlay only)")
+    parser.add_argument("--voice", choices=("auto", "gtts", "pyttsx3"), default="auto", help="TTS engine")
     args = parser.parse_args()
 
-    if not os.path.exists(args.video):
+    if not Path(args.video).exists():
         print(f"error: video not found: {args.video}")
         return 1
 
@@ -194,51 +251,44 @@ def main() -> int:
     speaker = Speaker(enabled=not args.no_speak, engine=args.voice)
     graph = build_graph(bot, speaker)
     cap = cv2.VideoCapture(args.video)
+    
     if not cap.isOpened():
+        cap.release()
         print(f"error: could not open video: {args.video}")
         return 1
 
-    # Some containers (e.g. this webm) report a nonsense FPS like 1000; clamp to a
-    # sane range so timestamps and playback speed stay realistic.
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if not (1.0 <= fps <= 120.0):
         fps = 30.0
     delay = max(1, int(1000.0 / fps))
     every = max(1, args.every)
 
-    # Windows and macOS use OpenCV's native GUI backend, which needs no $DISPLAY.
-    # Only Linux relies on X11: there OpenCV's QT/xcb backend hard-aborts the
-    # process (not a catchable exception) when it can't connect, so gate on
-    # $DISPLAY up front and fall back to console-only rather than crash.
-    show = sys.platform in ("win32", "darwin") or bool(os.environ.get("DISPLAY"))
+    show = sys.platform in ("win32", "darwin") or bool(sys.modules.get("os").environ.get("DISPLAY"))
     if show:
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     else:
-        print("[no $DISPLAY found; running console-only. On Wayland, ensure XWayland "
-              "is active, or run from an X session.]")
+        print("[no $DISPLAY found; running console-only.]")
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    save = False  # don't write the annotated video; play/process only
-    writer = None  # created lazily, once we know the frame size
+    fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+    save = bool(args.out)
+    writer = None 
 
-    caption = ""  # last gated announcement; only changes when an action begins
+    caption = "" 
+    audio_events: list[tuple[float, str]] = [] 
     max_frames = max(0, args.max_frames)
     idx = -1
+    
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
-            # Downscale the source frame once, up front: every downstream stage
-            # (overlay, model encode, video writer) then works on a small 256x256
-            # image instead of the full 2560x1440, cutting decode/copy cost.
-            frame = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_AREA)
+                
             idx += 1
             if max_frames and idx >= max_frames:
                 break
             t_sec = idx / fps
 
-            # The overlaid frame is exactly what we both show and save.
             vis = draw_reasoning(frame, caption, t_sec)
 
             if save:
@@ -252,25 +302,47 @@ def main() -> int:
                 if writer is not None:
                     writer.write(vis)
 
-            # Show the frame first so the window appears immediately (the first
-            # model call can take many seconds while gemma4 loads).
             if show:
                 cv2.imshow(WINDOW, vis)
-                if (cv2.waitKey(delay) & 0xFF) in (ord("q"), 27):  # q / Esc
+                if (cv2.waitKey(delay) & 0xFF) in (ord("q"), 27):
                     break
 
             if idx % every == 0:
-                result = graph.invoke({"frame": frame})
-                if result["spoken"]:  # an action just began -> announce + speak once
+                if idx == 0:
+                    print("[loading model; the first prediction can take a while ...]", flush=True)
+                
+                result = graph.invoke({"frame": frame, "t_sec": t_sec})
+                maneuver = result.get("maneuver", IDLE_MANEUVER)
+                
+                if result.get("spoken"):
                     caption = result["speech"]
-                    print(f"[{t_sec:7.2f}s] {result['maneuver']}: {caption}")
+                    audio_events.append((t_sec, caption))
+                    print(f"[{t_sec:7.2f}s] predict={maneuver} -> SPEAK: {caption}", flush=True)
+                else:
+                    print(f"[{t_sec:7.2f}s] predict={maneuver}", flush=True)
+                    
     finally:
         cap.release()
         cv2.destroyAllWindows()
         if writer is not None:
             writer.release()
-            print(f"saved annotated video -> {args.out}")
-        speaker.close()  # drain any commentary still being spoken
+        speaker.close()
+
+    if audio_events:
+        print("\n=== commentary transcript ===")
+        for t_sec, text in audio_events:
+            print(f"[{t_sec:7.2f}s] {text}")
+        print(f"=== {len(audio_events)} line(s) ===\n")
+    else:
+        print("\n[no commentary was generated for this run]\n")
+
+    if writer is not None and save:
+        events = [] if args.no_speak else audio_events
+        if events:
+            print(f"[finalizing {args.out} with {len(events)} commentary clip(s) ...]")
+        had_voice = finalize_video(args.out, events, speaker)
+        print(f"saved annotated video {'with voice' if had_voice else '(silent)'} -> {args.out}")
+        
     return 0
 
 

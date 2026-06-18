@@ -1,136 +1,145 @@
 """
-``Bot`` — loads the gemma4 vision model (local Ollama) and the prompts, and turns
-one video frame (base64 JPEG) into a structured JSON reply.
+Bot — loads a local Ollama vision model and turns one or more recent video frames
+into a structured {maneuver, commentary} JSON reply.
 
-The model is constrained to :data:`RESPONSE_SCHEMA` via Ollama's structured-output
-``format``, so ``invoke`` always returns well-formed JSON (maneuver / commentary)
-— reliable for the downstream parse + gate.
-
-The model settings (name, temperature, etc.) are plain ``__init__`` defaults.
-gemma4's "thinking" mode is disabled (``reasoning=False``) — otherwise it eats the
-small ``num_predict`` budget and returns empty content on image calls.
+Model choice is a speed/accuracy trade. The default is **gemma4:12b**, a non-thinking VLM:
+~0.8s/frame (near real-time over the whole video). Thinking is auto-disabled for gemma.
+A qwen3-vl thinking model is more careful on direction but ~6s/frame; pass that as 
+`model_name` and `reasoning` is left on automatically.
 """
 
 from __future__ import annotations
 
-import json
-import os
-from typing import Optional
+import sys
+from pathlib import Path
+from typing import Any, Literal, cast, get_args
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
+from pydantic import BaseModel, Field
 
-try:                       
+if sys.version_info >= (3, 11):
     import tomllib
-except ModuleNotFoundError:
+else:
     import tomli as tomllib
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_HERE = Path(__file__).resolve().parent
+
+# Define the allowed maneuvers as a strict Literal type for Pydantic validation
+ManeuverType = Literal[
+    "NO_ACTION_STEADY_STATE",
+    "SLOWING_DOWN", 
+    "STOPPING", 
+    "YIELDING",
+    "TURNING_LEFT", 
+    "TURNING_RIGHT",
+    "CHANGING_LANES",
+    "HAZARD_RESPONSE"
+]
+
+# Re-exported for main.py's gate/parse, derived from the Literal so there is one source of truth.
+IDLE_MANEUVER = "NO_ACTION_STEADY_STATE"
+MANEUVERS: tuple[str, ...] = get_args(ManeuverType)
 
 
-def _load_toml(path: str) -> dict:
-    """Load a TOML file, resolved relative to this file so the CWD doesn't matter."""
-    full = path if os.path.isabs(path) else os.path.join(_HERE, path)
-    with open(full, "rb") as file:
+class OutputSchema(BaseModel):
+    """The structured output schema expected from the Vision Model."""
+    maneuver: ManeuverType = Field(
+        default="NO_ACTION_STEADY_STATE",
+        description="The specific driving action the vehicle should take."
+    )
+    commentary: str = Field(
+        default="",
+        description="A brief explanation reasoning about the scene and the chosen maneuver."
+    )
+
+
+def _load_toml(path: str | Path) -> dict[str, Any]:
+    """Load a TOML file, resolved relative to this file."""
+    file_path = Path(path)
+    if not file_path.is_absolute():
+        file_path = _HERE / file_path
+        
+    with file_path.open("rb") as file:
         return tomllib.load(file)
 
 
-# The model is forced to emit JSON matching this schema (Ollama structured output),
-# so downstream stages never have to cope with prose, code fences, or malformed JSON.
-RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        # "Maneuver Detected" in the prompt; NO_ACTION_STEADY_STATE means cruising
-        # steadily with a clear path -> stay silent (empty commentary).
-        "maneuver": {
-            "type": "string",
-            "enum": [
-                "NO_ACTION_STEADY_STATE",
-                "SLOWING_DOWN", "STOPPING", "YIELDING",
-                "TURNING_LEFT", "TURNING_RIGHT",
-                "CHANGING_LANES", "HAZARD_RESPONSE",
-                
-            ],
-        },
-        # "Commentary" in the prompt: the first-person passenger-facing speech;
-        # empty string when the maneuver is NO_ACTION_STEADY_STATE.
-        "commentary": {"type": "string"},
-    },
-    "required": ["maneuver", "commentary"],
-}
-
-
 class Bot:
-    """Loads gemma4 (ChatOllama) + prompts; ``invoke(image_b64)`` returns JSON text."""
-
     def __init__(
         self,
-        model_name: Optional[str] = None,
+        model_name: str | None = None,
         *,
-        temperature: float = 0.2,             # low -> stable, deterministic captions
-        num_predict: int = 256,               # small budget; keep replies short
-        prompts_path: str = "configs/prompt.toml",
-    ):
+        temperature: float = 0.0,             
+        num_predict: int = 2048,              
+        reasoning: bool | None = None,     
+        prompts_path: str | Path = "configs/prompt.toml",
+    ) -> None:
         prompts = _load_toml(prompts_path)
 
-        self.model_name = model_name or "gemma4:e2b-it-qat"
-        self.temperature = temperature
-        self.num_predict = num_predict
+        self.model_name: str = model_name or "nemotron3:33b"
+        self.temperature: float = temperature
+        self.num_predict: int = num_predict
 
-        self.system_prompt: str = prompts["system"].strip()
-        self.user_prompt: str = prompts["user"].strip()
+        self.system_prompt: str = str(prompts.get("System", "")).strip()
+        self.user_prompt: str = str(prompts.get("User", "")).strip()
 
-        self.history = []  # recent maneuvers, fed back to the model as memory
+        if reasoning is None:
+            reasoning = False if "gemma" in self.model_name.lower() else None
 
-        self.model = ChatOllama(
+        # 1. Initialize the base ChatOllama model
+        base_model = ChatOllama(
             model=self.model_name,
             temperature=self.temperature,
             num_predict=self.num_predict,
-            format=RESPONSE_SCHEMA,  # force structured JSON output
-            reasoning=False,  # see module docstring
+            seed=0,
+            reasoning=None,
+        )
+        
+        # 2. Bind the Pydantic schema to force structured JSON output
+        self.vision_model = base_model.with_structured_output(OutputSchema)
+
+    def _build_messages(self, images: list[str]) -> list[BaseMessage]:
+        """Stage 1 — Formats the prompts and base64 images into a LangChain message payload."""
+        if not images:
+            raise ValueError("The 'images' list cannot be empty.")
+
+        frame_context = (
+            "the current frame" 
+            if len(images) == 1 
+            else f"{len(images)} consecutive frames, oldest first and newest last"
         )
 
-    def invoke(self, image_b64: str) -> str:
-        """Run one vision call on a base64 JPEG and return schema-constrained JSON text.
-
-        A short MEMORY of recent maneuvers is fed in so the model fills ``utterance``
-        only when a NEW action begins (and stays silent on continuations/cruising).
-        """
-        messages = [
-            SystemMessage(content=self.system_prompt),
-            HumanMessage(
-                content=[
-                    {"type": "text", "text": f"{self.user_prompt}\n\n{self._memory_note()}"},
-                    {
-                        "type": "image_url",
-                        "image_url": f"data:image/jpeg;base64,{image_b64}",
-                    },
-                ]
-            ),
+        # FIX 2: Use list[Any] to satisfy LangChain's strict invariant dict typing
+        content: list[Any] = [
+            {"type": "text", "text": f"{self.user_prompt}\n\n(You are given {frame_context}.)"}
         ]
-        reply = self.model.invoke(messages)
-        text = reply.content if isinstance(reply.content, str) else str(reply.content)
-        self._remember(text)
-        return text
-
-    def _memory_note(self) -> str:
-        """Summarize recent maneuvers so the model can detect a NEW action."""
-        if not self.history:
-            return "MEMORY: this is the first frame — the vehicle has no previous maneuver."
-        recent = ", ".join(self.history[-5:])
-        return (
-            f'MEMORY: the vehicle\'s previous maneuver was {self.history[-1]} '
-            f'(recent, oldest->newest: {recent}). Fill "commentary" ONLY if this frame '
-            'begins a NEW action different from that previous maneuver; otherwise set '
-            '"commentary" to an empty string and the maneuver to NO_ACTION_STEADY_STATE.'
+        
+        content.extend(
+            {"type": "image_url", "image_url": f"data:image/jpeg;base64,{b64}"}
+            for b64 in images
         )
 
-    def _remember(self, reply_text: str) -> None:
-        """Record this frame's maneuver so the next call knows the prior state."""
-        try:
-            maneuver = str(json.loads(reply_text).get("maneuver", "")).strip().upper()
-        except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
-            maneuver = ""
-        if maneuver:
-            self.history.append(maneuver)
-            del self.history[:-10]  
+        # FIX 1: Explicitly type the list as list[BaseMessage] before returning
+        messages: list[BaseMessage] = [
+            SystemMessage(content=self.system_prompt),
+            HumanMessage(content=content)
+        ]
+
+        return messages
+    
+    def invoke(self, frames: str | list[str]) -> tuple[str, str]:
+        """Process frames and return the maneuver and commentary."""
+        images = [frames] if isinstance(frames, str) else list(frames)
+        
+        # 1. Build the payload
+        messages = self._build_messages(images)
+        
+        prediction = self.vision_model.invoke(messages)
+
+        print(prediction)
+        # 2. Invoke the model (returns the validated Pydantic OutputSchema)
+        output = cast(OutputSchema, self.vision_model.invoke(messages))
+
+        
+        # 3. Return the fields directly from the Pydantic model
+        return output.maneuver, output.commentary
